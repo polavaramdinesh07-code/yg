@@ -3,12 +3,11 @@ import xml.etree.ElementTree as ET
 import json
 from botocore.exceptions import NoCredentialsError, ClientError
 from collections import defaultdict
-import os # Useful for mocking file paths if needed
 
 ## Configuration: CHANGE THESE VALUES 
 # Replace with your actual S3 bucket name and the key (path) to your XML file
-BUCKET_NAME = 'your-s3-bucket-name' 
-S3_KEY = 'path/to/your/hive_sample.xml'   
+BUCKET_NAME = 'datasci-share' # Based on your image output
+S3_KEY = 'drone_images/xml_file/hive_sample.xml' # Based on your image output
 # ----------------------------------------
 
 def xml_to_dict_raw(element):
@@ -36,7 +35,7 @@ def xml_to_dict_raw(element):
     if element.attrib:
         if d[element.tag] is None:
              d[element.tag] = {}
-        # Store attributes directly without prefixing @ for easier access in the transformation step
+        # Store attributes directly without prefixing @ for easier access
         d[element.tag].update(element.attrib) 
 
     if d[element.tag] == {}:
@@ -44,38 +43,54 @@ def xml_to_dict_raw(element):
 
     return d
 
-def transform_to_labelstudio_format(xml_data_dict):
+def transform_to_labelstudio_format(raw_xml_dict, bucket_name):
     """
-    Transforms the raw XML dictionary into the specific Label Studio JSON task format.
-    
-    Key Transformation:
-    1. Extracts image dimensions and path.
-    2. Converts absolute pixel coordinates (xtl, ybr, etc.) into normalized 
-       percentages (x, y, width, height) relative to the image size (0 to 100).
-    3. Restructures data into Label Studio's required 'predictions/result' format.
+    Transforms the raw XML dictionary into the specific Label Studio JSON task format,
+    handling coordinate normalization and structure.
     """
-    # 1. Get the root image data and dimensions
-    image_element = xml_data_dict.get('image', {})
+    # 1. Dynamically get the key of the root element (e.g., 'image' or 'annotation')
+    # This fixes the issue of assuming a fixed root tag.
+    try:
+        root_tag = next(iter(raw_xml_dict))
+    except StopIteration:
+        print("[ERROR] XML dictionary is empty.")
+        return []
+        
+    image_element = raw_xml_dict.get(root_tag, {})
     
-    # Use image name from XML to construct the expected Label Studio 'image' path
+    # 2. Extract image data and dimensions
     image_name = image_element.get('name') 
-    # NOTE: You may need to adjust the path '/data/local-files/?d=' based on your LS setup
-    ls_image_path = f"/data/local-files/?d={image_name}" 
     
-    width = float(image_element.get('width', 1))
-    height = float(image_element.get('height', 1))
+    # Set the path as S3 for Label Studio. Adjust prefix if using Local Files or other storage.
+    if image_name:
+        ls_image_path = f"s3://{bucket_name}/{image_name}"
+    else:
+        # Fallback for the image path if 'name' attribute is missing
+        ls_image_path = "/data/local-files/?d=None" 
+        print("[WARNING] Image 'name' attribute is missing in XML.")
+
+    try:
+        # Get dimensions for normalization. Default to 1 to prevent division by zero.
+        width = float(image_element.get('width', 1))
+        height = float(image_element.get('height', 1))
+    except ValueError:
+        print("[ERROR] Invalid width or height found in XML. Using default 1.")
+        width = 1
+        height = 1
     
-    # Collect all annotation elements (boxes and polygons)
     annotations = []
     
-    # 2. Process all <box> elements (assuming rectanglelabels)
-    # Ensure 'box' is treated as a list, even if only one exists
+    # 3. Process all <box> elements (Rectangle Labels)
     box_list = image_element.get('box')
-    if box_list is not None:
-        if not isinstance(box_list, list):
-            box_list = [box_list]
+    
+    # Ensure box_list is a list or empty for iteration
+    if box_list is None:
+        box_list = []
+    elif not isinstance(box_list, list):
+        box_list = [box_list]
 
-        for box in box_list:
+    for box in box_list:
+        try:
             # Absolute pixel coordinates
             xtl = float(box.get('xtl', 0))
             ytl = float(box.get('ytl', 0))
@@ -89,35 +104,38 @@ def transform_to_labelstudio_format(xml_data_dict):
             normalized_w = ((xbr - xtl) / width) * 100.0
             normalized_h = ((ybr - ytl) / height) * 100.0
             
-            # 3. Build the Label Studio result object
+            # 4. Build the Label Studio result object
             result_item = {
                 "value": {
                     "x": normalized_x,
                     "y": normalized_y,
                     "width": normalized_w,
                     "height": normalized_h,
-                    "rotation": 0, # Assuming no rotation from the XML sample
+                    "rotation": 0, 
                     "rectangleLabels": [label]
                 },
-                "from_name": "label", # Default name for the labeling config's control tag
-                "to_name": "image",   # Default name for the object tag (Image in LS)
+                "from_name": "label", 
+                "to_name": "image",   
                 "type": "rectanglelabels",
-                # Note: Score is not in XML, so we omit or set to None/1.0
-                # If you need a score field, uncomment and set a value:
-                # "score": 1.0 
             }
             annotations.append(result_item)
             
-    # 4. Construct the final Label Studio task structure
+        except Exception as e:
+            print(f"[WARNING] Skipping a box annotation due to error: {e}")
+            continue
+
+    # 5. Process <polygon> elements (Polygon Labels) - Add this if needed
+    # (Not strictly required by your JSON sample, but included for completeness if your XML has them)
+    # The logic for converting polygon points is more complex and depends on the XML point structure.
+    
+    # 6. Construct the final Label Studio task structure
     ls_task = [
         {
             "data": {
-                # This path needs to be correct for your Label Studio project configuration
                 "image": ls_image_path 
             },
             "predictions": [
                 {
-                    # Assuming a single model/prediction run
                     "model_version": "xml_import_v1", 
                     "result": annotations
                 }
@@ -147,7 +165,7 @@ def load_and_convert_s3_xml_to_labelstudio_json(bucket_name, s3_key):
         raw_xml_dict = xml_to_dict_raw(xml_root)
         
         # 4. Transform the raw dictionary into the Label Studio task structure
-        labelstudio_task_data = transform_to_labelstudio_format(raw_xml_dict)
+        labelstudio_task_data = transform_to_labelstudio_format(raw_xml_dict, bucket_name)
         
         # 5. Convert the dictionary list to a formatted JSON string
         json_output = json.dumps(labelstudio_task_data, indent=4)
@@ -160,6 +178,9 @@ def load_and_convert_s3_xml_to_labelstudio_json(bucket_name, s3_key):
         return None
     except ClientError as e:
         print(f"\n[ERROR] An S3 client error occurred: {e}")
+        return None
+    except ET.ParseError as e:
+        print(f"\n[ERROR] Failed to parse XML content. Ensure the file is well-formed. Details: {e}")
         return None
     except Exception as e:
         print(f"\n[ERROR] An unexpected error occurred: {e}")
